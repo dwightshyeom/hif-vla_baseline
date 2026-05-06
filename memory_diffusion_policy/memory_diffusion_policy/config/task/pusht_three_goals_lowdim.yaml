@@ -1,0 +1,42 @@
+name: pusht_three_goals_lowdim
+
+obs_dim: 20  # 9*2 current keypoints + 2 agent_pos = 18 + 2 = 20 (goals are fixed, not in obs)
+action_dim: 2
+keypoint_dim: 2
+
+env_runner:
+  _target_: memory_diffusion_policy.env_runner.pusht_keypoints_three_goals_runner.PushTKeypointsThreeGoalsRunner
+  keypoint_visible_rate: ${keypoint_visible_rate}
+  n_train: 6
+  n_train_vis: 2
+  train_start_seed: 0
+  n_test: 50
+  n_test_vis: 50
+  legacy_test: True
+  test_start_seed: 100000
+  max_steps: 500  # Increased to allow visiting all three goals
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  n_latency_steps: ${n_latency_steps}
+  fps: 10
+  agent_keypoints: False
+  past_action: ${past_action_visible}
+  n_envs: null
+  # Three goals forming a large equilateral triangle (well-separated)
+  goal_pose_1: [160, 360, 0.785398]   # [x, y, theta] where theta = pi/4 (bottom-left)
+  goal_pose_2: [256, 152, 0]          # [x, y, theta] where theta = 0 (top)
+  goal_pose_3: [352, 360, -0.785398]  # [x, y, theta] where theta = -pi/4 (bottom-right)
+  # Goal variation: perturb goal poses randomly each episode (0 = fixed, >0 = varied)
+  # IMPORTANT: Must match the variation used during demonstration collection for consistency
+  goal_pos_variation: 0.0    # Max positional perturbation in pixels (e.g., 30.0)
+  goal_rot_variation: 0.0    # Max rotational perturbation in radians (e.g., 0.3)
+
+dataset:
+  _target_: memory_diffusion_policy.dataset.pusht_three_goals_dataset.PushTThreeGoalsLowdimDataset #
+  zarr_path: data/pusht_three_goals_demo_with_indicator.zarr
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.02
+  max_train_episodes: null

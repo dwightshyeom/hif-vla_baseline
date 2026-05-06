@@ -1,0 +1,53 @@
+# HiF-VLA fine-tuning config for the Swap-T (Push-T) task.
+#
+# These values are passed to finetune_pusht.py via draccus CLI args.
+# You can override any field on the command line:
+#   accelerate launch baseline/training/finetune_pusht.py --config configs/train_hifvla_pusht.yaml
+#
+# IMPORTANT: run the script from the HiF-VLA/ subdirectory so that
+# check_model_logic_mismatch() can locate ./prismatic/ correctly.
+
+# --- Paths ---
+vla_path: "../openvla_oft/openvla_clean_weights"
+zarr_path: "../memory_diffusion_policy/swap_3t_dataset_320"
+run_root_dir: "../runs/pusht_hifvla"
+
+# Flow caches are stored next to the zarr store by default (auto-detected when
+# these are left blank). Set explicit paths here to override.
+flow_cache_path: "../memory_diffusion_policy/flow_cache.npy"
+flow_stats_path: "../memory_diffusion_policy/flow_stats.npz"
+
+# --- Architecture ---
+use_l1_regression: true
+use_film: false
+num_images_in_input: 1
+use_proprio: true
+
+# --- HiF-VLA motion encoder ---
+history_length: 8
+
+# --- LoRA ---
+use_lora: true
+lora_rank: 32
+lora_dropout: 0.0
+merge_lora_during_training: false
+
+# --- Training ---
+batch_size: 4
+grad_accumulation_steps: 4        # effective batch = 16
+learning_rate: 5.0e-4
+lr_warmup_steps: 500
+num_steps_before_decay: 50000
+max_steps: 50005
+save_freq: 10000
+save_latest_checkpoint_only: false
+image_aug: true
+val_fraction: 0.1
+use_val_set: false
+val_freq: 5000
+val_time_limit: 120
+
+# --- Logging ---
+wandb_entity: "your-wandb-entity"   # <-- replace with your W&B entity
+wandb_project: "hifvla-pusht"
+wandb_log_freq: 10

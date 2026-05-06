@@ -1,0 +1,200 @@
+defaults:
+  - _self_
+  - task: pusht_image_three_goals_obs_action_chunk_lstm
+
+name: train_diffusion_unet_hybrid_lstm
+_target_: memory_diffusion_policy.workspace.train_diffusion_unet_hybrid_lstm_workspace.TrainDiffusionUnetHybridLSTMWorkspace
+
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+exp_name: "default"
+
+horizon: 8
+n_obs_steps: 1
+n_action_steps: 4
+n_latency_steps: 0
+past_action_visible: False
+
+# ---- LSTM settings ----
+lstm_checkpoint_path: "outputs/obs_action_chunk_lstm_image_three_goals_vision_320_step_1_hidden_64/best_model.pt"  # path to pretrained LSTM checkpoint
+action_step_subsample: 1  # must match LSTM pretraining subsample rate (NOT n_action_steps)
+lstm_latent_type: 'hidden'    # 'hidden' | 'past_dct_coeff' | 'future_action'
+lstm_hidden_size: 64
+
+# ---- Rollout mode ----
+# "wandb" (default): all envs in parallel, videos uploaded to wandb.
+# "local":           rollout_n_envs envs at a time, videos saved on disk
+#                    under <output_dir>/epoch_<E>_rollout/. Wandb still gets
+#                    the numerical metrics, just not the videos.
+rollout_mode: "wandb"
+rollout_n_envs: null
+
+# ---- LSTM hidden-state projection ----
+use_hidden_projection: true
+projection_output_dim: 20 #120
+projection_num_layers: 2
+
+# ---- Obs feature projection ----
+use_obs_projection: false # true #false
+obs_projection_output_dim: 32
+obs_projection_num_layers: 2
+
+# ---- Vector Quantization ----
+use_vq: true #false
+vq_num_embeddings: 128
+vq_commitment_weight: 0.25
+vq_loss_weight: 1.0
+
+# ---- Attention gate on LSTM hidden state ----
+# Applied after VQ (if enabled) and before the projection MLP.
+# mode: 'self'            - gate depends only on the hidden state (SE-Net style)
+#        'obs_conditioned' - gate also depends on current obs features
+use_attention_gate: false
+attention_gate_reduction: 4   # bottleneck: hidden_dim // reduction
+attention_gate_mode: 'self'   # 'self' | 'obs_conditioned'
+
+# ---- Intermediate obs for LSTM during rollout ----
+# When true, the runner feeds ALL intermediate observations from the
+# n_action_steps chunk to the frozen LSTM (one LSTM step per raw action).
+# Requires the LSTM to be pretrained with action_step_subsample=1.
+feed_intermediate_obs_to_lstm: true
+
+obs_as_global_cond: True
+num_kp: 32
+
+policy:
+  _target_: memory_diffusion_policy.policy.diffusion_unet_hybrid_image_policy_with_obs_action_chunk_lstm.DiffusionUnetHybridImagePolicyWithObsActionChunkLSTM
+
+  shape_meta: ${shape_meta}
+
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    variance_type: fixed_small
+    clip_sample: True
+    prediction_type: epsilon
+
+  horizon: ${horizon}
+  n_action_steps: ${eval:'${n_action_steps}+${n_latency_steps}'}
+  n_obs_steps: ${n_obs_steps}
+  num_inference_steps: 100
+  obs_as_global_cond: ${obs_as_global_cond}
+  crop_shape: [76, 76]
+  num_kp: ${num_kp}
+  diffusion_step_embed_dim: 128
+  down_dims: [512, 1024, 2048]
+  kernel_size: 5
+  n_groups: 8
+  cond_predict_scale: True
+  obs_encoder_group_norm: True
+  eval_fixed_crop: True
+
+  # LSTM conditioning
+  lstm_checkpoint_path: ${lstm_checkpoint_path}
+  lstm_hidden_size: ${lstm_hidden_size}
+  lstm_latent_type: ${lstm_latent_type}
+
+  # Hidden projection
+  use_hidden_projection: ${use_hidden_projection}
+  projection_output_dim: "${eval: ${projection_output_dim} if ${use_hidden_projection} else None}"
+  projection_num_layers: ${projection_num_layers}
+
+  # Obs feature projection
+  use_obs_projection: ${use_obs_projection}
+  obs_projection_output_dim: "${eval: ${obs_projection_output_dim} if ${use_obs_projection} else None}"
+  obs_projection_num_layers: ${obs_projection_num_layers}
+
+  # VQ
+  use_vq: ${use_vq}
+  vq_num_embeddings: ${vq_num_embeddings}
+  vq_commitment_weight: ${vq_commitment_weight}
+  vq_loss_weight: ${vq_loss_weight}
+
+  # Attention gate
+  use_attention_gate: ${use_attention_gate}
+  attention_gate_reduction: ${attention_gate_reduction}
+  attention_gate_mode: ${attention_gate_mode}
+
+  # Intermediate obs mode
+  feed_intermediate_obs_to_lstm: ${feed_intermediate_obs_to_lstm}
+
+ema:
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 64
+  num_workers: 8
+  shuffle: True
+  pin_memory: True
+  persistent_workers: False
+
+val_dataloader:
+  batch_size: 64
+  num_workers: 8
+  shuffle: False
+  pin_memory: True
+  persistent_workers: False
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.95, 0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-6
+
+training:
+  device: "cuda:0"
+  seed: 42
+  debug: False
+  resume: True
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  num_epochs: 30500000000
+  gradient_accumulate_every: 1
+  use_ema: True
+  rollout_every: 50
+  checkpoint_every: 50
+  val_every: 1
+  sample_every: 5
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+
+logging:
+  project: diffusion_policy_debug
+  resume: True
+  mode: online
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+  tags: ["${name}", "${task_name}", "${exp_name}"]
+  id: null
+  group: null
+
+checkpoint:
+  topk:
+    monitor_key: test_mean_score
+    mode: max
+    k: 5
+    format_str: 'epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt'
+  save_last_ckpt: True
+  save_last_snapshot: False
+
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}

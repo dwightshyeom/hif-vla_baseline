@@ -1,0 +1,103 @@
+defaults:
+  - _self_
+
+name: train_obs_action_chunk_lstm
+_target_: memory_diffusion_policy.workspace.train_obs_action_chunk_lstm_workspace.TrainObsActionChunkLSTMWorkspace
+
+# All keys below are forwarded to memory_diffusion_policy/workspace/
+# train_obs_action_chunk_lstm_workspace.py::run_lstm_pretrain via an
+# argparse.Namespace.  Override on the command line, e.g.
+#   python train.py --config-name=train_obs_action_chunk_lstm_workspace \
+#     lstm_pretrain.zarr_path=/path/to.zarr \
+#     lstm_pretrain.batch_size=32 lstm_pretrain.num_epochs=2
+lstm_pretrain:
+  zarr_path: data/pusht_three_goals_demo_pos_30_rot_0.3.zarr
+  val_ratio: 0.15
+  seed: 42
+
+  # Action step alignment with DP — set to DP n_action_steps; 1 = no subsampling
+  action_step_subsample: 1
+
+  # Model architecture
+  hidden_size: 64
+  num_layers: 2
+  dropout: 0.1
+
+  # Observation input mode
+  keypoint_only: false
+  keypoint_dim: 18
+
+  action_only: false
+  include_goal_keypoints: true
+
+  # Future action chunk head
+  use_future_head: true
+  chunk_H: 16
+  num_future_modes: 1
+  future_mode_cls_weight: 0.1
+  future_entropy_weight: 0.01
+  future_abstraction: raw
+  future_n_bases: 8
+  future_dct_freq_decay: 0.0
+
+  # Observation prediction head
+  use_obs_head: false
+
+  # Past action chunk head
+  use_past_head: true
+  past_chunk_H: 300
+  past_temporal_weight: uniform
+  past_temporal_alpha: 2.0
+  past_abstraction: dct
+  past_n_bases: 32
+  past_dct_freq_decay: 0.0
+  spatial_threshold: 0.1
+  past_consistency_weight: 0.1
+  past_consistency_n_steps: [1, 2, 4, 8]
+
+  # Action noise augmentation
+  action_noise_scale: 0.1
+  action_dropout_prob: 0.05
+  action_noise_warmup: 50
+
+  # VQ bottleneck (off by default)
+  use_vq: false
+  vq_n_codes: 512
+  vq_commitment_weight: 0.25
+
+  # Loss weights
+  obs_loss_weight: 1.0
+  future_loss_weight: 1.0
+  past_loss_weight: 1.0
+  l1_on_hidden_state: true
+  l1_weight: 0.1
+
+  # Training
+  batch_size: 16
+  num_epochs: 1000
+  lr: 0.001
+  device: cuda
+  num_workers: 4
+
+  # Output (left empty by default; the workspace overrides this with the
+  # hydra-managed output_dir so checkpoints land alongside DP runs)
+  output_dir: null
+
+  # Weights & Biases
+  use_wandb: false
+  wandb_project: obs_action_chunk_lstm
+  wandb_entity: null
+  wandb_run_name: null
+
+# Hydra run dir + checkpoint plumbing (so the BaseWorkspace machinery has
+# the keys it expects when invoked by train.py).  These don't actually
+# control the LSTM pretraining loop, which writes its own logs/ckpts under
+# lstm_pretrain.output_dir or the hydra output dir.
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}
+    subdir: ${hydra.job.num}

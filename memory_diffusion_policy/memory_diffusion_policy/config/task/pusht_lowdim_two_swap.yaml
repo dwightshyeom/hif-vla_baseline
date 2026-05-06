@@ -1,0 +1,39 @@
+name: pusht_lowdim_two_swap
+
+# 18 blue_kps + 18 red_kps + 2 agent + 18 blue_target + 18 red_target = 74
+# Set to 38 (and flip include_target_keypoints to False below) if you want
+# to drop target keypoints from the observation.
+obs_dim: 74
+action_dim: 2
+keypoint_dim: 2
+
+env_runner:
+  _target_: memory_diffusion_policy.env_runner.pusht_keypoints_two_swap_runner.PushTKeypointsTwoSwapRunner
+  keypoint_visible_rate: ${keypoint_visible_rate}
+  n_train: 6
+  n_train_vis: 2
+  train_start_seed: 0
+  n_test: 50
+  n_test_vis: 50
+  legacy_test: False
+  test_start_seed: 100000
+  max_steps: 500
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  n_latency_steps: ${n_latency_steps}
+  fps: 10
+  include_target_keypoints: True
+  past_action: ${past_action_visible}
+  n_envs: null
+  blue_start_side: 'random'  # demos cover both sides; sample per-env from seed
+
+dataset:
+  _target_: memory_diffusion_policy.dataset.pusht_two_swap_lowdim_dataset.PushTTwoSwapLowdimDataset
+  zarr_path: data/swap_t_dataset_160
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.02
+  max_train_episodes: null
+  include_target_keypoints: True  # must match env_runner.include_target_keypoints

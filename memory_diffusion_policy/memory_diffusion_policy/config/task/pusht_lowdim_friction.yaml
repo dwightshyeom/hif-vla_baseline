@@ -1,0 +1,39 @@
+name: pusht_lowdim_friction
+
+# 18 block_kps + 2 agent = 20 (+ 2 memory_flags = 22 when enabled)
+# Flip obs_dim AND include_memory_flags consistently across env_runner and dataset.
+obs_dim: 22
+action_dim: 2
+keypoint_dim: 2
+
+env_runner:
+  _target_: memory_diffusion_policy.env_runner.pusht_keypoints_friction_runner.PushTKeypointsFrictionRunner
+  keypoint_visible_rate: ${keypoint_visible_rate}
+  n_train: 6
+  n_train_vis: 2
+  train_start_seed: 0
+  n_test: 50
+  n_test_vis: 50
+  legacy_test: False
+  test_start_seed: 100000
+  max_steps: 1200
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  n_latency_steps: ${n_latency_steps}
+  fps: 10
+  agent_keypoints: False
+  include_memory_flags: True   # must match dataset.include_memory_flags
+  past_action: ${past_action_visible}
+  n_envs: null
+  debug_show_friction: False
+
+dataset:
+  _target_: memory_diffusion_policy.dataset.pusht_friction_lowdim_dataset.PushTFrictionLowdimDataset
+  zarr_path: data/pusht_friction_demo.zarr
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.02
+  max_train_episodes: null
+  include_memory_flags: True   # must match env_runner.include_memory_flags

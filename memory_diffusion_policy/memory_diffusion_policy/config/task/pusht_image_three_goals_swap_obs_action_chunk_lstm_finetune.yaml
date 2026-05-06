@@ -1,0 +1,47 @@
+name: pusht_image_three_goals_swap_obs_action_chunk_lstm_finetune
+
+image_shape: &image_shape [3, 96, 96]
+shape_meta: &shape_meta
+  obs:
+    image:
+      shape: *image_shape
+      type: rgb
+    agent_pos:
+      shape: [2]
+      type: low_dim
+  action:
+    shape: [2]
+
+env_runner:
+  _target_: memory_diffusion_policy.env_runner.pusht_image_three_goals_swap_runner.PushTImageThreeGoalsSwapRunner
+  n_train: 6
+  n_train_vis: 6
+  train_start_seed: 0
+  n_test: 50
+  n_test_vis: 50
+  legacy_test: False
+  test_start_seed: 100000
+  max_steps: 600
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  fps: 10
+  past_action: ${past_action_visible}
+  n_envs: ${oc.select:rollout_n_envs,null}
+  rollout_mode: ${oc.select:rollout_mode,wandb}
+
+# LSTM+DP finetune stage: jointly finetunes the LSTM core with DP. The
+# finetune dataset pre-encodes images with the (frozen) LSTM visual encoder,
+# caches features, then runs the LSTM core live during training. Same zarr
+# schema as the frozen-latent variant.
+dataset:
+  _target_: memory_diffusion_policy.dataset.obs_action_chunk_lstm_image_finetune_dataset.ObsActionChunkLSTMImageFinetuneDataset
+  zarr_path: data/three_goals_swap_demo.zarr
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.02
+  max_train_episodes: null
+  lstm_checkpoint_path: ${lstm_checkpoint_path}
+  lstm_normalizer_path: null
+  device: ${training.device}

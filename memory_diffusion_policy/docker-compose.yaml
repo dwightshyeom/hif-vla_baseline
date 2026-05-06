@@ -1,0 +1,52 @@
+# =============================================================================
+#  docker-compose.yaml — GPU services for Memory_DP (memory_diffusion_policy)
+# =============================================================================
+#
+#  Usage examples:
+#    docker compose build                                     # build the image
+#    docker compose run --rm dev                              # interactive shell
+#    docker compose run --rm train \
+#      python train.py --config-name=train_diffusion_unet_hybrid_workspace \
+#                      task=pusht_image_friction_three_tracks
+#    docker compose run --rm train \
+#      python train.py --config-name=train_obs_action_chunk_lstm_image_workspace \
+#                      lstm_pretrain.zarr_path=data/pusht_2d_friction_demos_320.zarr
+#
+# =============================================================================
+
+x-gpu-defaults: &gpu-defaults
+  build: .
+  image: memory-diffusion-policy:latest
+  runtime: nvidia
+  shm_size: '48gb'
+  environment:
+    - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+    - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    - WANDB_API_KEY=${WANDB_API_KEY:-}
+  volumes:
+    - ./data:/workspace/data
+    - ./outputs:/workspace/outputs
+  working_dir: /workspace
+
+services:
+  # -----------------------------------------------------------------------
+  # train: hydra-driven training — drives both DP and LSTM-pretrain
+  #        workspaces.  Override `command:` on the CLI:
+  #          docker compose run --rm train python train.py --config-name=...
+  # -----------------------------------------------------------------------
+  train:
+    <<: *gpu-defaults
+    command: bash
+
+  # -----------------------------------------------------------------------
+  # dev: interactive bash shell with the source live-mounted for editing
+  # -----------------------------------------------------------------------
+  dev:
+    <<: *gpu-defaults
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./data:/workspace/data
+      - ./outputs:/workspace/outputs
+      - .:/workspace
+    command: bash

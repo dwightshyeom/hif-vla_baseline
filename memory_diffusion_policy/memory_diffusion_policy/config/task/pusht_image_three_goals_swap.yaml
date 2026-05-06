@@ -1,0 +1,46 @@
+name: pusht_image_three_goals_swap
+
+image_shape: &image_shape [3, 96, 96]
+shape_meta: &shape_meta
+  obs:
+    image:
+      shape: *image_shape
+      type: rgb
+    agent_pos:
+      shape: [2]
+      type: low_dim
+  action:
+    shape: [2]
+
+env_runner:
+  _target_: memory_diffusion_policy.env_runner.pusht_image_three_goals_swap_runner.PushTImageThreeGoalsSwapRunner
+  n_train: 6
+  n_train_vis: 6
+  train_start_seed: 0
+  n_test: 50
+  n_test_vis: 50
+  legacy_test: False
+  test_start_seed: 100000
+  max_steps: 600
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  fps: 10
+  past_action: ${past_action_visible}
+  # Rollout knobs (overridable from the top-level workspace yaml):
+  #   n_envs        — envs in parallel per chunk. null → n_train+n_test.
+  #                   Pair a small int with rollout_mode=local on RAM-tight boxes.
+  #   rollout_mode  — "wandb" (upload videos to wandb) or "local"
+  #                   (save to <output_dir>/epoch_<E>_rollout/; wandb still
+  #                   gets the numerical metrics).
+  n_envs: ${oc.select:rollout_n_envs,null}
+  rollout_mode: ${oc.select:rollout_mode,wandb}
+
+dataset:
+  _target_: memory_diffusion_policy.dataset.pusht_three_goals_swap_image_dataset.PushTThreeGoalsSwapImageDataset
+  zarr_path: data/swap_3t_dataset_320.zarr
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.02
+  max_train_episodes: null

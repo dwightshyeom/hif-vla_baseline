@@ -1,0 +1,47 @@
+name: pusht_three_goals_lowdim_obs_action_chunk_lstm
+
+# obs_dim is now computed in the workspace config based on use_projection toggle.
+# Kept here as a fallback default; the workspace config overrides it.
+obs_dim: 60  # overridden by workspace config
+action_dim: 2
+keypoint_dim: 2
+
+env_runner:
+  _target_: memory_diffusion_policy.env_runner.pusht_keypoints_three_goals_runner.PushTKeypointsThreeGoalsRunner
+  keypoint_visible_rate: ${keypoint_visible_rate}
+  n_train: 6
+  n_train_vis: 2
+  train_start_seed: 0
+  n_test: 50
+  n_test_vis: 50
+  legacy_test: True
+  test_start_seed: 100000
+  max_steps: 900
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  n_latency_steps: ${n_latency_steps}
+  fps: 10
+  agent_keypoints: False
+  past_action: ${past_action_visible}
+  n_envs: null
+  # Three goals forming a large equilateral triangle
+  goal_pose_1: [160, 360, 0.785398]   # bottom-left
+  goal_pose_2: [256, 152, 0]          # top
+  goal_pose_3: [352, 360, -0.785398]  # bottom-right
+  goal_pos_variation: ${goal_pos_variation}
+  goal_rot_variation: ${goal_rot_variation}
+  include_goal_keypoints: ${include_goal_keypoints}
+
+dataset:
+  _target_: memory_diffusion_policy.dataset.obs_action_chunk_lstm_chunked_latent_dataset.ObsActionChunkLSTMChunkedLatentDataset
+  zarr_path: data/pusht_three_goals_demo_pos_30_rot_0.3.zarr #data/pusht_three_goals_demo_with_indicator.zarr
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.02
+  max_train_episodes: 160   # set to an integer to limit training demos (e.g. 200)
+  lstm_checkpoint_path: "outputs/obs_action_chunk_lstm_varying_goal_only_past_actions/best_model.pt"
+  include_goal_keypoints: ${include_goal_keypoints}
+  lstm_latent_type: ${lstm_latent_type}
+  device: ${training.device}

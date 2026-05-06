@@ -1,0 +1,26 @@
+# Ignore things that should not be in the Docker build context
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.git/
+.gitignore
+
+# Large data — mounted at runtime, not baked into the image
+data/
+
+# Outputs / logs — mounted at runtime
+outputs/
+data/outputs/
+wandb/
+multirun/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS artifacts
+.DS_Store
+Thumbs.db

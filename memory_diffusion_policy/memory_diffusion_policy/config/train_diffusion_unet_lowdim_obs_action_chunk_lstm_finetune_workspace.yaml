@@ -1,0 +1,216 @@
+defaults:
+  - _self_
+  - task: pusht_three_goals_lowdim_obs_action_chunk_lstm_finetune
+
+name: train_diffusion_unet_lowdim
+_target_: memory_diffusion_policy.workspace.train_diffusion_unet_lowdim_obs_action_chunk_lstm_finetune_workspace.TrainDiffusionUnetLowdimLSTMFinetuneWorkspace
+
+action_dim: ${task.action_dim}
+keypoint_dim: ${task.keypoint_dim}
+task_name: ${task.name}
+exp_name: "default"
+
+horizon: 8
+n_obs_steps: 1
+n_action_steps: 4
+n_latency_steps: 0
+past_action_visible: False
+keypoint_visible_rate: 1.0
+obs_as_local_cond: False
+obs_as_global_cond: True
+pred_action_steps_only: True
+
+# ---- LSTM hidden-state projection toggle ----
+use_hidden_projection: true
+projection_concat: false
+projection_output_dim: 20
+projection_num_layers: 2
+lstm_hidden_size: 64
+raw_obs_dim: 74 #20
+
+# ---- Observation projection toggle ----
+use_obs_projection: true #false #true
+obs_projection_output_dim: 20
+obs_projection_num_layers: 2
+
+# ---- Goal keypoints toggle ----
+include_goal_keypoints: true
+# The LSTM may have been trained WITH goal keypoints even when the DP
+# does not use them.  Set this to true to provide the LSTM with the
+# full observation it was trained on (both in dataset and env_runner).
+lstm_include_goal_keypoints: true
+
+# ---- Goal variation ----
+goal_pos_variation: 30.0
+goal_rot_variation: 0.3
+
+# ---- Vector Quantization toggle ----
+use_vq: true
+vq_num_embeddings: 128
+vq_commitment_weight: 0.25
+vq_loss_weight: 1.0
+
+# ---- LSTM Finetuning options ----
+# Scale the learning rate for LSTM parameters relative to the DP learning rate.
+# 1.0 = same lr; < 1.0 = lower lr for LSTM (recommended for stable finetuning).
+lstm_lr_scale: 0.1
+# Number of epochs to keep the LSTM frozen before starting finetuning.
+# Used by "warmup_then_joint" schedule.
+freeze_lstm_epochs: 300
+# Finetuning schedule mode:
+#   "joint"             — train LSTM + DP together from epoch 0 (default)
+#   "warmup_then_joint" — freeze LSTM for freeze_lstm_epochs, then train both
+#   "alternating"       — rotate: train DP only -> train LSTM only -> ...
+finetune_schedule: "warmup_then_joint" #"alternating" #"joint"
+# Number of epochs per phase for "alternating" schedule.
+alternating_epoch_period: 300 #10
+
+# obs_dim is computed automatically (identical to frozen variant)
+_obs_effective: "${eval: ${obs_projection_output_dim} if ${use_obs_projection} else ${raw_obs_dim}}"
+_hidden_effective: "${eval: ${projection_output_dim} if ${use_hidden_projection} else ${lstm_hidden_size}}"
+obs_dim: "${eval: ${projection_output_dim} if ${use_hidden_projection} and ${projection_concat} else ${_obs_effective} + ${_hidden_effective}}"
+
+policy:
+  _target_: memory_diffusion_policy.policy.diffusion_unet_lowdim_policy_with_obs_action_chunk_lstm_finetune.DiffusionUnetLowdimPolicyWithObsActionChunkLSTMFinetune
+
+  model:
+    _target_: memory_diffusion_policy.model.diffusion.conditional_unet1d.ConditionalUnet1D
+    input_dim: "${eval: ${action_dim} if ${obs_as_local_cond} or ${obs_as_global_cond} else ${obs_dim} + ${action_dim}}"
+    local_cond_dim: "${eval: ${obs_dim} if ${obs_as_local_cond} else None}"
+    global_cond_dim: "${eval: ${obs_dim}*${n_obs_steps} if ${obs_as_global_cond} else None}"
+    diffusion_step_embed_dim: 256
+    down_dims: [256, 512, 1024]
+    kernel_size: 5
+    n_groups: 8
+    cond_predict_scale: True
+
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    variance_type: fixed_small
+    clip_sample: True
+    prediction_type: epsilon
+
+  horizon: ${horizon}
+  obs_dim: ${obs_dim}
+  action_dim: ${action_dim}
+  n_action_steps: ${eval:'${n_action_steps}+${n_latency_steps}'}
+  n_obs_steps: ${n_obs_steps}
+  num_inference_steps: 100
+  obs_as_local_cond: ${obs_as_local_cond}
+  obs_as_global_cond: ${obs_as_global_cond}
+  pred_action_steps_only: ${pred_action_steps_only}
+  oa_step_convention: True
+  raw_obs_dim: ${raw_obs_dim}
+
+  # Pretrained ObsActionChunkLSTM — loaded from checkpoint, TRAINABLE
+  lstm_checkpoint_path: "outputs/obs_action_chunk_lstm_varying_goal_keypoints/best_model.pt" #"outputs/obs_action_chunk_lstm_no_goal_keypoints/best_model.pt"
+  lstm_hidden_size: ${lstm_hidden_size}
+  # LSTM normalizer (defaults to <checkpoint_dir>/normalizer.pt if null)
+  lstm_normalizer_path: null
+
+  # Hidden projection
+  use_hidden_projection: ${use_hidden_projection}
+  projection_output_dim: "${eval: ${projection_output_dim} if ${use_hidden_projection} else None}"
+  projection_num_layers: ${projection_num_layers}
+  projection_concat: ${projection_concat}
+
+  # Observation projection
+  use_obs_projection: ${use_obs_projection}
+  obs_projection_output_dim: ${obs_projection_output_dim}
+  obs_projection_num_layers: ${obs_projection_num_layers}
+
+  # Vector Quantization
+  use_vq: ${use_vq}
+  vq_num_embeddings: ${vq_num_embeddings}
+  vq_commitment_weight: ${vq_commitment_weight}
+  vq_loss_weight: ${vq_loss_weight}
+
+  # Finetuning options
+  lstm_lr_scale: ${lstm_lr_scale}
+  freeze_lstm_epochs: ${freeze_lstm_epochs}
+
+ema:
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 256
+  num_workers: 1
+  shuffle: True
+  pin_memory: True
+  persistent_workers: False
+
+val_dataloader:
+  batch_size: 256
+  num_workers: 1
+  shuffle: False
+  pin_memory: True
+  persistent_workers: False
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.95, 0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-6
+
+training:
+  device: "cuda:0"
+  seed: 42
+  debug: False
+  resume: True
+  # optimisation
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  num_epochs: 500000000
+  gradient_accumulate_every: 1
+  use_ema: True
+  # training loop control (in epochs)
+  rollout_every: 50
+  checkpoint_every: 50
+  val_every: 1
+  sample_every: 5
+  # steps per epoch
+  max_train_steps: null
+  max_val_steps: null
+  # misc
+  tqdm_interval_sec: 1.0
+
+logging:
+  project: diffusion_policy_debug
+  resume: True
+  mode: online
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+  tags: ["${name}", "${task_name}", "${exp_name}"]
+  id: null
+  group: null
+
+checkpoint:
+  topk:
+    monitor_key: test_mean_score
+    mode: max
+    k: 5
+    format_str: 'epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt'
+  save_last_ckpt: True
+  save_last_snapshot: False
+
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}

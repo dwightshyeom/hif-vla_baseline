@@ -1,0 +1,51 @@
+name: pusht_image_asym
+
+image_shape: &image_shape [3, 96, 96]
+shape_meta: &shape_meta
+  obs:
+    image:
+      shape: *image_shape
+      type: rgb
+    agent_pos:
+      shape: [2]
+      type: low_dim
+  action:
+    shape: [2]
+
+env_runner:
+  _target_: memory_diffusion_policy.env_runner.pusht_asym_image_runner.PushTAsymImageRunner
+  n_train: 6
+  n_train_vis: 6
+  train_start_seed: 0
+  n_test: 50
+  n_test_vis: 50
+  legacy_test: False
+  test_start_seed: 100000
+  max_steps: 400   # asym demos have mean=153, p95=218, max=326 — give policy room
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  fps: 10
+  past_action: ${past_action_visible}
+  # Rollout knobs (overridable from the top-level workspace yaml):
+  #   n_envs        — envs in parallel per chunk. null → n_train+n_test.
+  #                   Pair a small int with rollout_mode=local on RAM-tight boxes.
+  #   rollout_mode  — "wandb" (upload videos to wandb) or "local"
+  #                   (save to <output_dir>/epoch_<E>_rollout/; wandb still
+  #                   gets the numerical metrics).
+  n_envs: ${oc.select:rollout_n_envs,null}
+  rollout_mode: ${oc.select:rollout_mode,wandb}
+  randomize_goal: False
+  heavy_mass: 15.0
+  light_mass: 0.1
+
+dataset:
+  # PushTFrictionImageDataset slices state[:, :2] as agent_pos, which works for
+  # asym's 8-dim state too (heavy_segment, goal_keypoint, etc. live in dims 2:).
+  _target_: memory_diffusion_policy.dataset.pusht_friction_image_dataset.PushTFrictionImageDataset
+  zarr_path: data/pusht_asym_demos_320_96.zarr
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.02
+  max_train_episodes: null

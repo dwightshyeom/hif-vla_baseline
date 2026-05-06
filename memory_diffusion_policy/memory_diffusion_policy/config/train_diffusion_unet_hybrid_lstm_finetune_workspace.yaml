@@ -1,0 +1,252 @@
+defaults:
+  - _self_
+  - task: pusht_image_three_goals_obs_action_chunk_lstm_finetune
+
+name: train_diffusion_unet_hybrid_lstm_finetune
+_target_: memory_diffusion_policy.workspace.train_diffusion_unet_hybrid_lstm_finetune_workspace.TrainDiffusionUnetHybridLSTMFinetuneWorkspace
+
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+exp_name: "default"
+
+horizon: 8
+n_obs_steps: 1
+n_action_steps: 4
+n_latency_steps: 0
+past_action_visible: False
+
+# ---- LSTM settings ----
+lstm_checkpoint_path: "outputs/obs_action_chunk_lstm_image_three_goals_vision_320_step_1_hidden_64/best_model.pt"
+lstm_hidden_size: 64
+# ---- Misc rollout options ----
+action_step_subsample: 1  # must match LSTM pretraining subsample rate (NOT n_action_steps)
+# When true, runner feeds all intermediate observations between DP decisions
+# to the frozen LSTM. Requires action_step_subsample=1 pretraining.
+feed_intermediate_obs_to_lstm: true
+
+# ---- Rollout mode ----
+# "wandb" (default): all envs in parallel, videos uploaded to wandb.
+# "local":           rollout_n_envs envs at a time, videos saved on disk
+#                    under <output_dir>/epoch_<E>_rollout/. Wandb still gets
+#                    the numerical metrics, just not the videos.
+rollout_mode: "wandb"
+rollout_n_envs: null
+
+# ---- LSTM hidden-state projection ----
+use_hidden_projection: true
+projection_output_dim: 20
+projection_num_layers: 2
+
+# ---- Obs feature projection ----
+use_obs_projection: false
+obs_projection_output_dim: 32
+obs_projection_num_layers: 2
+
+# ---- Vector Quantization ----
+use_vq: true #false
+vq_num_embeddings: 128
+vq_commitment_weight: 0.25
+vq_loss_weight: 1.0
+
+# ---- Attention gate on LSTM hidden state ----
+use_attention_gate: false
+attention_gate_reduction: 4
+attention_gate_mode: 'self'
+
+# ---- Finetuning options ----
+# Scale the learning rate for LSTM core parameters relative to the DP lr.
+# < 1.0 = lower lr for LSTM (recommended for stable finetuning).
+lstm_lr_scale: 0.1
+# Number of epochs to keep the LSTM frozen before finetuning.
+# Used by 'warmup_then_joint' schedule.
+freeze_lstm_epochs: 100
+# Finetuning schedule mode:
+#   'joint'             — train LSTM core + DP from epoch 0
+#   'warmup_then_joint' — freeze LSTM for freeze_lstm_epochs, then train both
+#   'alternating'       — rotate: DP only → LSTM only → ...
+finetune_schedule: "warmup_then_joint"
+# Number of epochs per phase for 'alternating' schedule.
+alternating_epoch_period: None #300
+
+# ---- DCT action-chunk loss ----
+# Adds an extra MSE loss on truncated DCT coefficients of the predicted
+# action chunk vs the GT action chunk (both in DP-normalised space; the
+# predicted x_0 is recovered from the epsilon prediction).
+#
+# Gradient routing:
+#   Warm-up phase (LSTM core fully frozen — detected by the workspace):
+#       → DCT is SUPPRESSED. All trainable params (DP + hidden_vq +
+#         attention_gate + hidden_projection) receive raw_loss only.
+#         This makes the warm-up phase identical to use_dct_loss=false
+#         and avoids leaking DCT into the projection modules whose
+#         intended target (the LSTM core) is frozen.
+#
+#   Post warm-up (LSTM core trainable):
+#     use_dct_loss=false
+#         → no DCT loss anywhere (default; back-compat).
+#     use_dct_loss=true,  dct_loss_on_dp=true       (single backward)
+#         → DP-only       (UNet, obs_encoder, obs_projection)     ← raw + α·dct
+#         → LSTM-pathway  (LSTM core, hidden_vq, attention_gate,
+#                          hidden_projection)                      ← raw + α·dct
+#     use_dct_loss=true,  dct_loss_on_dp=false      (workspace dual-backward)
+#         → DP-only       (UNet, obs_encoder, obs_projection)     ← raw_loss only
+#         → LSTM-pathway  (LSTM core, hidden_vq, attention_gate,
+#                          hidden_projection)                      ← raw + α·dct
+#
+# dct_n_bases ≤ horizon. == horizon → full basis (DCT loss == time-domain
+# MSE on x_0_pred vs GT, by Parseval). < horizon → low-pass focus on the
+# smoothest action-chunk components.
+use_dct_loss: false #true #false
+dct_loss_weight: 1.0      # alpha
+dct_loss_on_dp: false     # post warm-up only: if true, DP also receives DCT loss
+dct_n_bases: 4 #null         # null → defaults to horizon
+
+obs_as_global_cond: True
+num_kp: 32
+
+policy:
+  _target_: memory_diffusion_policy.policy.diffusion_unet_hybrid_image_policy_with_obs_action_chunk_lstm_finetune.DiffusionUnetHybridImagePolicyWithObsActionChunkLSTMFinetune
+
+  shape_meta: ${shape_meta}
+
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    variance_type: fixed_small
+    clip_sample: True
+    prediction_type: epsilon
+
+  horizon: ${horizon}
+  n_action_steps: ${eval:'${n_action_steps}+${n_latency_steps}'}
+  n_obs_steps: ${n_obs_steps}
+  num_inference_steps: 100
+  obs_as_global_cond: ${obs_as_global_cond}
+  crop_shape: [76, 76]
+  num_kp: ${num_kp}
+  diffusion_step_embed_dim: 128
+  down_dims: [512, 1024, 2048]
+  kernel_size: 5
+  n_groups: 8
+  cond_predict_scale: True
+  obs_encoder_group_norm: True
+  eval_fixed_crop: True
+
+  # LSTM
+  lstm_checkpoint_path: ${lstm_checkpoint_path}
+  lstm_hidden_size: ${lstm_hidden_size}
+  lstm_latent_type: 'hidden'
+
+  # Hidden projection
+  use_hidden_projection: ${use_hidden_projection}
+  projection_output_dim: "${eval: ${projection_output_dim} if ${use_hidden_projection} else None}"
+  projection_num_layers: ${projection_num_layers}
+
+  # Obs feature projection
+  use_obs_projection: ${use_obs_projection}
+  obs_projection_output_dim: "${eval: ${obs_projection_output_dim} if ${use_obs_projection} else None}"
+  obs_projection_num_layers: ${obs_projection_num_layers}
+
+  # VQ
+  use_vq: ${use_vq}
+  vq_num_embeddings: ${vq_num_embeddings}
+  vq_commitment_weight: ${vq_commitment_weight}
+  vq_loss_weight: ${vq_loss_weight}
+
+  # Attention gate
+  use_attention_gate: ${use_attention_gate}
+  attention_gate_reduction: ${attention_gate_reduction}
+  attention_gate_mode: ${attention_gate_mode}
+
+  # Finetuning options
+  lstm_lr_scale: ${lstm_lr_scale}
+  freeze_lstm_epochs: ${freeze_lstm_epochs}
+
+  # Rollout
+  feed_intermediate_obs_to_lstm: ${feed_intermediate_obs_to_lstm}
+
+  # DCT action-chunk loss
+  use_dct_loss: ${use_dct_loss}
+  dct_loss_weight: ${dct_loss_weight}
+  dct_loss_on_dp: ${dct_loss_on_dp}
+  dct_n_bases: ${dct_n_bases}
+
+ema:
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 32
+  num_workers: 4
+  shuffle: True
+  pin_memory: True
+  persistent_workers: False
+
+val_dataloader:
+  batch_size: 32
+  num_workers: 4
+  shuffle: False
+  pin_memory: True
+  persistent_workers: False
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.95, 0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-6
+
+training:
+  device: "cuda:0"
+  seed: 42
+  debug: False
+  resume: True
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  num_epochs: 30500000000
+  gradient_accumulate_every: 1
+  use_ema: True
+  rollout_every: 50
+  checkpoint_every: 50
+  val_every: 1
+  sample_every: 5
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+
+logging:
+  project: diffusion_policy_debug
+  resume: True
+  mode: online
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+  tags: ["${name}", "${task_name}", "${exp_name}"]
+  id: null
+  group: null
+
+checkpoint:
+  topk:
+    monitor_key: test_mean_score
+    mode: max
+    k: 5
+    format_str: 'epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt'
+  save_last_ckpt: True
+  save_last_snapshot: False
+
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}
