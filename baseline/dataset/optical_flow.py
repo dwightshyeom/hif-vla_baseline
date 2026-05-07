@@ -230,6 +230,7 @@ def load_or_compute_flow_stats(
         save_flow_stats(mean, std, flow_stats_path)
     return mean, std
 
+
 def normalize_flow(
     flow: np.ndarray,
     mean: np.ndarray,

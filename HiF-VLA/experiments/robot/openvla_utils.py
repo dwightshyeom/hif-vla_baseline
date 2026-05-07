@@ -83,10 +83,12 @@ def update_auto_map(pretrained_checkpoint: str) -> None:
     with open(config_path, "r") as f:
         config = json.load(f)
 
-    config["auto_map"] = {
-        "AutoConfig": "configuration_prismatic.OpenVLAConfig",
-        "AutoModelForVision2Seq": "modeling_prismatic.OpenVLAForActionPrediction",
-    }
+    auto_map = dict(config.get("auto_map") or {})
+    auto_map["AutoConfig"] = "configuration_prismatic.OpenVLAConfig"
+    auto_map["AutoModelForVision2Seq"] = "modeling_prismatic.OpenVLAForActionPrediction"
+    auto_map["AutoProcessor"] = "processing_prismatic.PrismaticProcessor"
+    auto_map["AutoImageProcessor"] = "processing_prismatic.PrismaticImageProcessor"
+    config["auto_map"] = auto_map
 
     # Write back the updated config
     with open(config_path, "w") as f:
@@ -96,6 +98,8 @@ def update_auto_map(pretrained_checkpoint: str) -> None:
     print("Changes made:")
     print('  - Set AutoConfig to "configuration_prismatic.OpenVLAConfig"')
     print('  - Set AutoModelForVision2Seq to "modeling_prismatic.OpenVLAForActionPrediction"')
+    print('  - Set AutoProcessor to "processing_prismatic.PrismaticProcessor"')
+    print('  - Set AutoImageProcessor to "processing_prismatic.PrismaticImageProcessor"')
 
 
 def check_identical_files(path1: Union[str, Path], path2: Union[str, Path]) -> bool:
@@ -182,8 +186,12 @@ def check_model_logic_mismatch(pretrained_checkpoint: str) -> None:
     if not os.path.isdir(pretrained_checkpoint):
         return
 
-    # Find current files
-    curr_files = {"modeling_prismatic.py": None, "configuration_prismatic.py": None}
+    # Find current files (sync to HF cache so trust_remote_code matches this repo).
+    curr_files = {
+        "modeling_prismatic.py": None,
+        "configuration_prismatic.py": None,
+        "processing_prismatic.py": None,
+    }
 
     for root, _, files in os.walk("./prismatic/"):
         for filename in curr_files.keys():
