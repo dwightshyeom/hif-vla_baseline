@@ -50,11 +50,9 @@ from transformers import PreTrainedTokenizerBase
 from baseline.dataset.optical_flow import (
     FLOW_H,
     FLOW_W,
-    compute_flow_stats,
-    load_flow_stats,
+    load_or_compute_flow_stats,
     normalize_flow,
     precompute_flow,
-    save_flow_stats,
 )
 
 # These imports require HiF-VLA to be on sys.path (done by the training script).
@@ -98,6 +96,24 @@ def _normalize_bounds_q99(
         -1.0,
         1.0,
     ).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Zarr zip compatibility (zarr v2: zarr.ZipStore; zarr v3: zarr.storage.ZipStore)
+# ---------------------------------------------------------------------------
+
+def _open_zarr_from_zip(zip_path: str):
+    """Open a zarr hierarchy stored in a single .zip file (v2 / v3 API)."""
+    if hasattr(zarr, "ZipStore"):
+        zs = zarr.ZipStore(zip_path, mode="r")
+    else:
+        # zarr-python 3.x
+        zs = zarr.storage.ZipStore(zip_path, mode="r")
+    try:
+        return zarr.open(zs, mode="r")
+    except TypeError:
+        # zarr v3 may require keyword ``store=``
+        return zarr.open(store=zs, mode="r")
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +163,15 @@ class PushTHiFVLADataset(IterableDataset):
         Path where ``dataset_statistics.json`` will be written.  Pass
         ``run_dir / "dataset_statistics.json"`` from the training script.
         Pass ``None`` when this loader is wrapped by ``MultiTaskPushTHiFVLADataset``.
+    ddp_rank : int
+        Distributed rank (``0`` when not using DDP).
+    ddp_world_size : int
+        World size (``1`` when not using DDP).  Each rank shuffles the same
+        ordering then consumes the slice ``indices[rank::world_size]`` so GPUs
+        see disjoint batches per sweep.
+    shuffle_seed : int
+        Seed for shuffling valid (episode, step) pairs.  Must match on every
+        rank so DDP partitions are consistent.
     """
 
     @staticmethod
@@ -191,7 +216,7 @@ class PushTHiFVLADataset(IterableDataset):
             )
 
         if zarr_path.endswith(".zip"):
-            return zarr.open(zarr.ZipStore(zarr_path, mode="r"), mode="r")
+            return _open_zarr_from_zip(zarr_path)
         return zarr.open(zarr_path, "r")
 
     def __init__(
@@ -210,6 +235,9 @@ class PushTHiFVLADataset(IterableDataset):
         dataset_name: Optional[str] = None,
         language_instruction: Optional[str] = None,
         proprio_output_dim: Optional[int] = None,
+        ddp_rank: int = 0,
+        ddp_world_size: int = 1,
+        shuffle_seed: int = 42,
     ) -> None:
         self.zarr_path = zarr_path
         self.action_tokenizer = action_tokenizer
@@ -224,6 +252,9 @@ class PushTHiFVLADataset(IterableDataset):
             else PUSHT_LANGUAGE_INSTRUCTION
         )
         self.proprio_output_dim = proprio_output_dim
+        self.ddp_rank = int(ddp_rank)
+        self.ddp_world_size = max(1, int(ddp_world_size))
+        self.shuffle_seed = int(shuffle_seed)
 
         # ------------------------------------------------------------------
         # Load zarr arrays
@@ -261,14 +292,9 @@ class PushTHiFVLADataset(IterableDataset):
         )
 
         # Flow normalisation statistics (training episodes only).
-        if flow_stats_path is not None and os.path.exists(flow_stats_path):
-            self.flow_mean, self.flow_std = load_flow_stats(flow_stats_path)
-        else:
-            train_mask = np.zeros(len(self.flows), dtype=bool)
-            train_mask[train_steps] = True
-            self.flow_mean, self.flow_std = compute_flow_stats(self.flows, valid_mask=train_mask)
-            if flow_stats_path is not None:
-                save_flow_stats(self.flow_mean, self.flow_std, flow_stats_path)
+        self.flow_mean, self.flow_std = load_or_compute_flow_stats(
+            self.flows, train_steps, flow_stats_path
+        )
 
         # ------------------------------------------------------------------
         # Action / proprio normalisation statistics (training episodes only)
@@ -433,14 +459,19 @@ class PushTHiFVLADataset(IterableDataset):
     # ------------------------------------------------------------------
 
     def __iter__(self):
-        rng = np.random.default_rng()
+        rng = np.random.default_rng(self.shuffle_seed)
         indices = list(self.valid_indices)
         rng.shuffle(indices)
+        if self.ddp_world_size > 1:
+            indices = indices[self.ddp_rank :: self.ddp_world_size]
         for ep_idx, global_t in indices:
             yield self._build_sample(ep_idx, global_t)
 
     def __len__(self) -> int:
-        return len(self.valid_indices)
+        n = len(self.valid_indices)
+        if self.ddp_world_size > 1:
+            return (n + self.ddp_world_size - 1 - self.ddp_rank) // self.ddp_world_size
+        return n
 
 
 def _safe_name_tag(name: str) -> str:
@@ -465,6 +496,9 @@ class MultiTaskPushTHiFVLADataset(IterableDataset):
         Directory for per-task ``flow_cache_*.npy`` / ``flow_stats_*.npz`` files.
     proprio_output_dim : int
         Passed to every child loader (use max state dim across zarrs).
+    ddp_rank, ddp_world_size, shuffle_seed
+        Same as :class:`PushTHiFVLADataset` (multi-task sharding is applied to
+        the combined stream of all tasks).
     """
 
     def __init__(
@@ -479,7 +513,13 @@ class MultiTaskPushTHiFVLADataset(IterableDataset):
         train: bool = True,
         val_fraction: float = 0.1,
         proprio_output_dim: int = 8,
+        ddp_rank: int = 0,
+        ddp_world_size: int = 1,
+        shuffle_seed: int = 42,
     ) -> None:
+        self.ddp_rank = int(ddp_rank)
+        self.ddp_world_size = max(1, int(ddp_world_size))
+        self.shuffle_seed = int(shuffle_seed)
         self._datasets: List[PushTHiFVLADataset] = []
         merged_stats: Dict[str, Any] = {}
         run_dir = Path(run_dir)
@@ -521,20 +561,27 @@ class MultiTaskPushTHiFVLADataset(IterableDataset):
         first_tag = _safe_name_tag(tasks[0]["dataset_name"])
         self.rollout_flow_stats_path = str(run_dir / f"flow_stats_{first_tag}.npz")
 
+        n_glob = sum(len(ds) for ds in self._datasets)
         print(
             f"[MultiTaskPushTHiFVLADataset] {len(self._datasets)} tasks, "
-            f"{len(self)} total training steps | rollout_flow_stats={self.rollout_flow_stats_path}"
+            f"{n_glob} training steps (global), {len(self)} per-rank | "
+            f"rollout_flow_stats={self.rollout_flow_stats_path}"
         )
 
     def __iter__(self):
-        rng = np.random.default_rng()
+        rng = np.random.default_rng(self.shuffle_seed)
         triples: List[Tuple[PushTHiFVLADataset, int, int]] = []
         for ds in self._datasets:
             for ep_idx, global_t in ds.valid_indices:
                 triples.append((ds, ep_idx, global_t))
         rng.shuffle(triples)
+        if self.ddp_world_size > 1:
+            triples = triples[self.ddp_rank :: self.ddp_world_size]
         for ds, ep_idx, global_t in triples:
             yield ds._build_sample(ep_idx, global_t)
 
     def __len__(self) -> int:
-        return sum(len(ds) for ds in self._datasets)
+        n = sum(len(ds) for ds in self._datasets)
+        if self.ddp_world_size > 1:
+            return (n + self.ddp_world_size - 1 - self.ddp_rank) // self.ddp_world_size
+        return n

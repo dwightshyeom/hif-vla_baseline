@@ -14,15 +14,14 @@
 # Usage:
 #   WANDB_ENTITY=seansyeom3 ZARR_PATH=/workspace/data.zarr.zip bash train_cloud.sh
 #
-# Multi-GPU (DDP): set how many processes = GPUs to use (default 6).
-#   NUM_GPUS=6 bash train_cloud.sh
-#   NUM_GPUS=1 bash train_cloud.sh   # single GPU
-
 set -euo pipefail
 
 # -----------------------------------------------------------------------
 # Configurable defaults (override via env vars before calling this script)
 # -----------------------------------------------------------------------
+# Multi-GPU (DDP): NUM_GPUS = accelerate processes (one per GPU). The training
+# script shards the IterableDataset per rank; flow cache is file-locked so only
+# one process precomputes. Global batch ≈ BATCH_SIZE * NUM_GPUS * GRAD_ACCUM.
 NUM_GPUS="${NUM_GPUS:-6}"
 WANDB_ENTITY="${WANDB_ENTITY:-your-wandb-entity}"
 WANDB_PROJECT="${WANDB_PROJECT:-hifvla-pusht}"

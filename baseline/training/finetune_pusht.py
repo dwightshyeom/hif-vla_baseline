@@ -180,23 +180,54 @@ def _resolve_path_for_training(
     *,
     must_be_file: bool = False,
 ) -> Path:
-    """Resolve a path that may be relative to cwd (e.g. HiF-VLA) or project root.
+    """Resolve paths from the task manifest or CLI.
 
-    Joining ``project_root / Path("../foo")`` incorrectly escapes the repo
-    (e.g. becomes ``/workspace/foo``).  Prefer ``cwd / raw`` first.
+    Manifest zarr paths are almost always relative to the **repo root**
+    (e.g. ``./swapt-shuffle/data.zarr.zip``), while the training script often
+    runs with ``cwd`` = ``HiF-VLA``. We therefore try **project_root** before
+    ``cwd`` for normal relative paths.
+
+    Paths that start with ``..`` are resolved against **cwd** first (e.g.
+    ``../configs`` from ``HiF-VLA``).
     """
     p = Path(raw)
     if p.is_absolute():
-        return p.resolve()
-    cand_cwd = (Path.cwd() / p).resolve()
-    exists_cwd = cand_cwd.is_file() if must_be_file else cand_cwd.exists()
-    if exists_cwd:
-        return cand_cwd
+        out = p.resolve()
+        _ok = out.is_file() if must_be_file else out.exists()
+        if not _ok:
+            raise FileNotFoundError(f"Path does not exist: {out}")
+        return out
+
+    parts = p.parts
+    prefer_cwd_first = bool(parts and parts[0] == "..")
+
     cand_root = (project_root / p).resolve()
-    exists_root = cand_root.is_file() if must_be_file else cand_root.exists()
-    if exists_root:
-        return cand_root
-    return cand_cwd
+    cand_cwd = (Path.cwd() / p).resolve()
+
+    if prefer_cwd_first:
+        order = [cand_cwd, cand_root]
+    else:
+        order = [cand_root, cand_cwd]
+
+    seen: set = set()
+    candidates: List[Path] = []
+    for c in order:
+        k = str(c)
+        if k not in seen:
+            seen.add(k)
+            candidates.append(c)
+
+    for c in candidates:
+        ok = c.is_file() if must_be_file else c.exists()
+        if ok:
+            return c
+
+    raise FileNotFoundError(
+        f"Could not find {raw!r}. Looked under repo root and cwd:\n"
+        + "\n".join(f"  - {c}" for c in candidates)
+        + f"\nPlace zarr files next to the manifest (under {project_root}), "
+        "or use absolute paths / hf:// URLs."
+    )
 
 
 def load_task_manifest(manifest_path: Path, project_root: Path) -> List[Dict[str, Any]]:
@@ -1012,6 +1043,13 @@ def finetune(cfg: FinetuneConfig) -> None:
     # ------------------------------------------------------------------
     # Dataset & DataLoader
     # ------------------------------------------------------------------
+    if dist.is_available() and dist.is_initialized():
+        ddp_rank = dist.get_rank()
+        ddp_world_size = dist.get_world_size()
+    else:
+        ddp_rank = 0
+        ddp_world_size = 1
+
     action_tokenizer = ActionTokenizer(processor.tokenizer)
 
     if tasks_list is not None:
@@ -1026,6 +1064,8 @@ def finetune(cfg: FinetuneConfig) -> None:
             train=True,
             val_fraction=cfg.val_fraction,
             proprio_output_dim=actual_proprio_dim,
+            ddp_rank=ddp_rank,
+            ddp_world_size=ddp_world_size,
         )
         flow_stats = train_dataset.rollout_flow_stats_path
     else:
@@ -1055,9 +1095,17 @@ def finetune(cfg: FinetuneConfig) -> None:
             train=True,
             val_fraction=cfg.val_fraction,
             proprio_output_dim=actual_proprio_dim,
+            ddp_rank=ddp_rank,
+            ddp_world_size=ddp_world_size,
         )
 
     if distributed_state.is_main_process:
+        eff_bs = cfg.batch_size * ddp_world_size * cfg.grad_accumulation_steps
+        print(
+            f"[DDP] world_size={ddp_world_size}  per-GPU batch={cfg.batch_size}  "
+            f"grad_accum={cfg.grad_accumulation_steps}  "
+            f"global batch (approx)={eff_bs}"
+        )
         save_dataset_statistics(train_dataset.dataset_statistics, run_dir)
 
     collator = PaddedCollatorForActionPrediction(

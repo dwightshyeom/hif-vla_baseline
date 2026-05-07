@@ -15,8 +15,10 @@ Design decisions:
   - Episode-boundary frames get zero flow (no preceding frame to diff against).
 """
 
+import fcntl
 import os
-from typing import Optional, Tuple
+from contextlib import contextmanager
+from typing import Iterator, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -24,6 +26,26 @@ import numpy as np
 # Target spatial resolution matching HiF-VLA's motion vector grid
 FLOW_H: int = 16
 FLOW_W: int = 16
+
+
+def _flock_path_for(path: str) -> str:
+    """Side-car lock file path for coordinating multi-process cache writes."""
+    d = os.path.dirname(os.path.abspath(path))
+    base = os.path.basename(path)
+    return os.path.join(d, f".{base}.flock")
+
+
+@contextmanager
+def _exclusive_flock(lock_path: str) -> Iterator[None]:
+    """Blocking exclusive lock shared across processes (Linux/macOS)."""
+    os.makedirs(os.path.dirname(os.path.abspath(lock_path)), exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 # ---------------------------------------------------------------------------
@@ -98,27 +120,38 @@ def precompute_flow(
         print(f"[optical_flow] Loading cached flow from {cache_path}")
         return np.load(cache_path)
 
-    n_steps = len(imgs)
-    flows = np.zeros((n_steps, 2, FLOW_H, FLOW_W), dtype=np.float32)
+    def _compute_and_maybe_save() -> np.ndarray:
+        n_steps = len(imgs)
+        flows = np.zeros((n_steps, 2, FLOW_H, FLOW_W), dtype=np.float32)
 
-    ep_starts = np.concatenate([[0], episode_ends[:-1]])
-    n_ep = len(episode_ends)
+        ep_starts = np.concatenate([[0], episode_ends[:-1]])
+        n_ep = len(episode_ends)
 
-    print(f"[optical_flow] Pre-computing flow for {n_steps} steps across {n_ep} episodes …")
-    for ep_i, (ep_s, ep_e) in enumerate(zip(ep_starts, episode_ends)):
-        if ep_i % 50 == 0:
-            print(f"  episode {ep_i}/{n_ep} (global step {ep_s})")
-        for t in range(int(ep_s) + 1, int(ep_e)):
-            prev_gray = cv2.cvtColor(imgs[t - 1], cv2.COLOR_RGB2GRAY)
-            curr_gray = cv2.cvtColor(imgs[t], cv2.COLOR_RGB2GRAY)
-            flows[t] = compute_frame_flow(prev_gray, curr_gray)
+        print(f"[optical_flow] Pre-computing flow for {n_steps} steps across {n_ep} episodes …")
+        for ep_i, (ep_s, ep_e) in enumerate(zip(ep_starts, episode_ends)):
+            if ep_i % 50 == 0:
+                print(f"  episode {ep_i}/{n_ep} (global step {ep_s})")
+            for t in range(int(ep_s) + 1, int(ep_e)):
+                prev_gray = cv2.cvtColor(imgs[t - 1], cv2.COLOR_RGB2GRAY)
+                curr_gray = cv2.cvtColor(imgs[t], cv2.COLOR_RGB2GRAY)
+                flows[t] = compute_frame_flow(prev_gray, curr_gray)
+
+        if cache_path is not None:
+            os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
+            np.save(cache_path, flows)
+            print(f"[optical_flow] Saved flow cache → {cache_path}")
+
+        return flows
 
     if cache_path is not None:
-        os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
-        np.save(cache_path, flows)
-        print(f"[optical_flow] Saved flow cache → {cache_path}")
+        lock_path = _flock_path_for(cache_path)
+        with _exclusive_flock(lock_path):
+            if os.path.exists(cache_path):
+                print(f"[optical_flow] Loading cached flow from {cache_path}")
+                return np.load(cache_path)
+            return _compute_and_maybe_save()
 
-    return flows
+    return _compute_and_maybe_save()
 
 
 # ---------------------------------------------------------------------------
@@ -170,9 +203,32 @@ def load_flow_stats(path: str) -> Tuple[np.ndarray, np.ndarray]:
     return data["mean"].astype(np.float32), data["std"].astype(np.float32)
 
 
-# ---------------------------------------------------------------------------
-# Normalisation helpers
-# ---------------------------------------------------------------------------
+def load_or_compute_flow_stats(
+    flows: np.ndarray,
+    train_steps: np.ndarray,
+    flow_stats_path: Optional[str],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Load flow mean/std from ``flow_stats_path`` if present; otherwise compute
+    from ``flows`` (training steps only) and save.  Uses a file lock so only
+    one process writes when training with DDP.
+    """
+    if flow_stats_path is not None and os.path.exists(flow_stats_path):
+        return load_flow_stats(flow_stats_path)
+
+    train_mask = np.zeros(len(flows), dtype=bool)
+    train_mask[train_steps] = True
+    mean, std = compute_flow_stats(flows, valid_mask=train_mask)
+
+    if flow_stats_path is None:
+        return mean, std
+
+    lock_path = _flock_path_for(flow_stats_path)
+    with _exclusive_flock(lock_path):
+        if os.path.exists(flow_stats_path):
+            return load_flow_stats(flow_stats_path)
+        save_flow_stats(mean, std, flow_stats_path)
+    return mean, std
 
 def normalize_flow(
     flow: np.ndarray,
