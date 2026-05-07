@@ -25,13 +25,15 @@ Or for single-GPU debugging:
     python baseline/training/finetune_pusht.py --vla_path ... --zarr_path ...
 """
 
+import itertools
+import json
 import os
 import sys
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Type
+from typing import Any, Dict, List, Optional, Tuple, Type
 
 # ---------------------------------------------------------------------------
 # Path setup — must happen before any HiF-VLA imports so that the "pusht"
@@ -92,7 +94,7 @@ from prismatic.vla.constants import (
 )
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 
-from baseline.dataset.pusht_hifvla_dataset import PushTHiFVLADataset
+from baseline.dataset.pusht_hifvla_dataset import MultiTaskPushTHiFVLADataset, PushTHiFVLADataset
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -107,7 +109,8 @@ class FinetuneConfig:
     vla_path: str = "openvla/openvla-7b"
 
     # Dataset
-    zarr_path: str = ""   # Path to swap_3t_dataset_320 zarr store
+    zarr_path: str = ""   # Path to swap_3t_dataset_320 zarr store (ignored if task_manifest is set)
+    task_manifest: Optional[str] = None  # JSON list of tasks: zarr_path, dataset_name, language
     run_root_dir: Path = Path("runs/pusht_hifvla")
     flow_cache_path: Optional[str] = None  # .npy cache for pre-computed flow
     flow_stats_path: Optional[str] = None  # .npz cache for flow mean/std
@@ -171,9 +174,50 @@ class FinetuneConfig:
     # fmt: on
 
 
-# ---------------------------------------------------------------------------
-# Utilities (reused verbatim from finetune.py)
-# ---------------------------------------------------------------------------
+def load_task_manifest(manifest_path: Path, project_root: Path) -> List[Dict[str, Any]]:
+    """Load a JSON manifest of multi-task training specs.
+
+    Each entry must include:
+      - ``zarr_path``: path to zarr dir or ``.zip`` (relative to ``project_root``
+        if not absolute); ``hf://org/repo/path`` is allowed.
+      - ``dataset_name``: key for ``dataset_statistics.json`` / ``norm_stats``.
+      - ``language`` or ``language_instruction``: task phrase for the prompt.
+    """
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    if not isinstance(raw, list):
+        raise ValueError("task manifest must be a JSON array of task objects")
+    tasks: List[Dict[str, Any]] = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ValueError(f"task_manifest[{i}] must be a JSON object")
+        zp = item.get("zarr_path")
+        if not zp:
+            raise ValueError(f"task_manifest[{i}] missing 'zarr_path'")
+        dname = item.get("dataset_name")
+        if not dname:
+            raise ValueError(f"task_manifest[{i}] missing 'dataset_name'")
+        lang = item.get("language_instruction") or item.get("language")
+        if not lang:
+            raise ValueError(
+                f"task_manifest[{i}] needs 'language' or 'language_instruction'"
+            )
+        if isinstance(zp, str) and zp.startswith("hf://"):
+            zpath_resolved = zp
+        else:
+            p = Path(zp)
+            if not p.is_absolute():
+                p = (project_root / p).resolve()
+            else:
+                p = p.resolve()
+            zpath_resolved = str(p)
+        tasks.append({
+            "zarr_path": zpath_resolved,
+            "dataset_name": dname,
+            "language_instruction": lang,
+        })
+    return tasks
+
 
 def remove_ddp_prefix(state_dict: dict) -> dict:
     return {
@@ -191,7 +235,7 @@ def get_run_id(cfg: FinetuneConfig) -> str:
             run_id = "--".join(run_id.split("--")[:-1])
         return run_id
     run_id = (
-        f"{cfg.vla_path.split('/')[-1]}+swap_3t"
+        f"{cfg.vla_path.split('/')[-1]}+{'multitask' if cfg.task_manifest and str(cfg.task_manifest).strip() else 'swap_3t'}"
         f"+b{cfg.batch_size * cfg.grad_accumulation_steps}"
         f"+lr-{cfg.learning_rate}"
         f"+his-{cfg.history_length}"
@@ -469,6 +513,7 @@ def do_training_rollout(
     device_id: int,
     gradient_step_idx: int,
     flow_stats_path: str,
+    actual_proprio_dim: int = 8,
 ) -> None:
     """
     Run ``cfg.n_rollout_episodes`` evaluation episodes with the *current* model
@@ -565,12 +610,17 @@ def do_training_rollout(
                     .to(device_id)
                 )  # (1, history_length, 2, FLOW_H, FLOW_W)
 
-                # Build proprio
-                proprio = np.concatenate([
-                    np.array(info["pos_agent"],       dtype=np.float32),
-                    np.array(info["blue_block_pose"], dtype=np.float32),
-                    np.array(info["red_block_pose"],  dtype=np.float32),
-                ])
+                # Build proprio — match the dimensionality that the dataset uses.
+                # 2D: just agent xy (pos_agent only)
+                # 8D: full state (agent xy + blue xytheta + red xytheta)
+                if actual_proprio_dim == 2:
+                    proprio = np.array(info["pos_agent"], dtype=np.float32)  # (2,)
+                else:
+                    proprio = np.concatenate([
+                        np.array(info["pos_agent"],       dtype=np.float32),  # (2,)
+                        np.array(info["blue_block_pose"], dtype=np.float32),  # (3,)
+                        np.array(info["red_block_pose"],  dtype=np.float32),  # (3,)
+                    ])  # (8,)
                 if cfg.use_proprio:
                     proprio_norm = vla.norm_stats[cfg.rollout_unnorm_key]["proprio"]
                     proprio = normalize_proprio(proprio, proprio_norm)
@@ -686,8 +736,16 @@ def _init_single_gpu_distributed() -> None:
 def finetune(cfg: FinetuneConfig) -> None:
     assert cfg.use_lora,          "Only LoRA fine-tuning is supported."
     assert cfg.use_l1_regression, "Must use L1 regression (use_l1_regression=True)."
-    assert cfg.use_hf_dataset or cfg.zarr_path, \
-        "Provide --zarr_path OR set --use_hf_dataset True."
+
+    use_manifest = bool(cfg.task_manifest and str(cfg.task_manifest).strip())
+    assert use_manifest or cfg.use_hf_dataset or cfg.zarr_path, (
+        "Provide --task_manifest, --zarr_path, OR set --use_hf_dataset True."
+    )
+    if use_manifest and cfg.use_hf_dataset:
+        raise ValueError(
+            "Do not combine --use_hf_dataset with --task_manifest. "
+            "Put hf://... URLs in each task's zarr_path in the JSON instead."
+        )
 
     cfg.vla_path = cfg.vla_path.rstrip("/")
     # Resolve to absolute path so AutoProcessor/AutoModel can find local checkpoints
@@ -695,9 +753,17 @@ def finetune(cfg: FinetuneConfig) -> None:
     if not model_is_on_hf_hub(cfg.vla_path):
         cfg.vla_path = str(Path(cfg.vla_path).resolve())
 
-    # HF Hub dataset: encode as hf://<repo>/<filename> so PushTHiFVLADataset
-    # can download it transparently via hf_hub_download.
-    if cfg.use_hf_dataset:
+    tasks_list: Optional[List[Dict[str, Any]]] = None
+
+    if use_manifest:
+        manifest_path = Path(cfg.task_manifest)
+        if not manifest_path.is_absolute():
+            manifest_path = (_PROJECT_ROOT / manifest_path).resolve()
+        else:
+            manifest_path = manifest_path.resolve()
+        tasks_list = load_task_manifest(manifest_path, _PROJECT_ROOT)
+        print(f"[task_manifest] Loaded {len(tasks_list)} tasks from {manifest_path}")
+    elif cfg.use_hf_dataset:
         cfg.zarr_path = f"hf://{cfg.hf_dataset_repo}/{cfg.hf_dataset_filename}"
         print(
             f"[HF Dataset] Will download zarr from {cfg.hf_dataset_repo} / "
@@ -707,7 +773,39 @@ def finetune(cfg: FinetuneConfig) -> None:
         cfg.zarr_path = str(Path(cfg.zarr_path).resolve())
 
     cfg.run_root_dir = Path(cfg.run_root_dir).resolve()
-    print(f"Fine-tuning OpenVLA `{cfg.vla_path}` on Swap-T (ACTION_DIM={ACTION_DIM})")
+
+    # ------------------------------------------------------------------
+    # Proprio dim: max over all tasks / single zarr (for one projector).
+    # ------------------------------------------------------------------
+    if tasks_list is not None:
+        dims: List[int] = []
+        for t in tasks_list:
+            _st = PushTHiFVLADataset.open_zarr(t["zarr_path"])
+            dims.append(int(_st["data/state"].shape[1]))
+            del _st
+        actual_proprio_dim = max(dims)
+        for t, d in zip(tasks_list, dims):
+            print(f"  task {t['dataset_name']!r}: state_dim={d}")
+        print(f"[Dataset] proprio_output_dim={actual_proprio_dim} (max across tasks)")
+        if actual_proprio_dim != PROPRIO_DIM:
+            print(
+                f"[NOTE] PROPRIO_DIM constant={PROPRIO_DIM} (Push-T default); "
+                f"training uses max zarr width {actual_proprio_dim}."
+            )
+    else:
+        _store = PushTHiFVLADataset.open_zarr(cfg.zarr_path)
+        actual_proprio_dim = int(_store["data/state"].shape[1])
+        del _store
+        if actual_proprio_dim != PROPRIO_DIM:
+            print(
+                f"[WARNING] zarr data/state has {actual_proprio_dim} columns but "
+                f"PROPRIO_DIM constant={PROPRIO_DIM}. "
+                f"Using actual dataset value ({actual_proprio_dim}) for the projector."
+            )
+        else:
+            print(f"[Dataset] proprio_dim={actual_proprio_dim} matches PROPRIO_DIM constant.")
+
+    print(f"Fine-tuning OpenVLA `{cfg.vla_path}` on Push-T (ACTION_DIM={ACTION_DIM})")
 
     run_id  = get_run_id(cfg)
     run_dir = cfg.run_root_dir / run_id
@@ -812,14 +910,14 @@ def finetune(cfg: FinetuneConfig) -> None:
         # infinite recursion in vla.train() / vla.parameters()).
         object.__setattr__(vla, 'module', vla)
 
-    # Proprio projector
+    # Proprio projector — use the dim actually present in the data, not the constant.
     proprio_projector = None
     if cfg.use_proprio:
         proprio_projector = init_module(
             ProprioProjector,
             "proprio_projector",
             cfg, device_id,
-            {"llm_dim": vla.module.llm_dim, "proprio_dim": PROPRIO_DIM},
+            {"llm_dim": vla.module.llm_dim, "proprio_dim": actual_proprio_dim},
         )
 
     # Action head (JointExpert)
@@ -892,32 +990,48 @@ def finetune(cfg: FinetuneConfig) -> None:
     # ------------------------------------------------------------------
     action_tokenizer = ActionTokenizer(processor.tokenizer)
 
-    # Default cache paths: store next to zarr for local datasets, or in
-    # run_dir for HF Hub downloads (where the zarr lives inside the HF cache).
-    if cfg.zarr_path.startswith("hf://"):
-        flow_cache = cfg.flow_cache_path or str(run_dir / "flow_cache.npy")
-        flow_stats = cfg.flow_stats_path or str(run_dir / "flow_stats.npz")
+    if tasks_list is not None:
+        train_dataset = MultiTaskPushTHiFVLADataset(
+            tasks=tasks_list,
+            action_tokenizer=action_tokenizer,
+            base_tokenizer=processor.tokenizer,
+            image_transform=processor.image_processor.apply_transform,
+            prompt_builder_fn=PurePromptBuilder,
+            run_dir=run_dir,
+            history_length=cfg.history_length,
+            train=True,
+            val_fraction=cfg.val_fraction,
+            proprio_output_dim=actual_proprio_dim,
+        )
+        flow_stats = train_dataset.rollout_flow_stats_path
     else:
-        flow_cache = cfg.flow_cache_path or str(
-            Path(cfg.zarr_path).parent / "flow_cache.npy"
-        )
-        flow_stats = cfg.flow_stats_path or str(
-            Path(cfg.zarr_path).parent / "flow_stats.npz"
-        )
+        # Default cache paths: store next to zarr for local datasets, or in
+        # run_dir for HF Hub downloads (where the zarr lives inside the HF cache).
+        if cfg.zarr_path.startswith("hf://"):
+            flow_cache = cfg.flow_cache_path or str(run_dir / "flow_cache.npy")
+            flow_stats = cfg.flow_stats_path or str(run_dir / "flow_stats.npz")
+        else:
+            flow_cache = cfg.flow_cache_path or str(
+                Path(cfg.zarr_path).parent / "flow_cache.npy"
+            )
+            flow_stats = cfg.flow_stats_path or str(
+                Path(cfg.zarr_path).parent / "flow_stats.npz"
+            )
 
-    train_dataset = PushTHiFVLADataset(
-        zarr_path=cfg.zarr_path,
-        action_tokenizer=action_tokenizer,
-        base_tokenizer=processor.tokenizer,
-        image_transform=processor.image_processor.apply_transform,
-        prompt_builder_fn=PurePromptBuilder,
-        history_length=cfg.history_length,
-        flow_cache_path=flow_cache,
-        flow_stats_path=flow_stats,
-        stats_save_path=str(run_dir / "dataset_statistics.json"),
-        train=True,
-        val_fraction=cfg.val_fraction,
-    )
+        train_dataset = PushTHiFVLADataset(
+            zarr_path=cfg.zarr_path,
+            action_tokenizer=action_tokenizer,
+            base_tokenizer=processor.tokenizer,
+            image_transform=processor.image_processor.apply_transform,
+            prompt_builder_fn=PurePromptBuilder,
+            history_length=cfg.history_length,
+            flow_cache_path=flow_cache,
+            flow_stats_path=flow_stats,
+            stats_save_path=str(run_dir / "dataset_statistics.json"),
+            train=True,
+            val_fraction=cfg.val_fraction,
+            proprio_output_dim=actual_proprio_dim,
+        )
 
     if distributed_state.is_main_process:
         save_dataset_statistics(train_dataset.dataset_statistics, run_dir)
@@ -947,7 +1061,11 @@ def finetune(cfg: FinetuneConfig) -> None:
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
         vla.train()
         optimizer.zero_grad()
-        for batch_idx, batch in enumerate(dataloader):
+        # IterableDataset yields each sample once per DataLoader pass.  Without
+        # cycling, training would stop after a single epoch (~few k steps) even
+        # when max_steps is much larger.  itertools.cycle restarts the loader;
+        # each new pass re-calls PushTHiFVLADataset.__iter__ (fresh shuffle).
+        for batch_idx, batch in enumerate(itertools.cycle(dataloader)):
 
             # Regenerate motion token for actual batch size (handles last batch).
             actual_bs = batch["input_ids"].shape[0]
@@ -1039,6 +1157,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                     device_id=device_id,
                     gradient_step_idx=log_step,
                     flow_stats_path=flow_stats,
+                    actual_proprio_dim=actual_proprio_dim,
                 )
 
             if log_step >= cfg.max_steps:

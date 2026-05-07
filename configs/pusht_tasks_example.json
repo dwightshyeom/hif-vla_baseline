@@ -1,0 +1,22 @@
+[
+  {
+    "zarr_path": "./pusht-three-goals/data.zarr.zip",
+    "dataset_name": "pusht-three-goals",
+    "language": "push the gray T block to overlap with each of the three target areas only once"
+  },
+  {
+    "zarr_path": "./pusht-three-tracks/data.zarr.zip",
+    "dataset_name": "pusht-three-tracks",
+    "language": "push the gray T block from the starting area to the overlap with the target area on the opposite side"
+  },
+  {
+    "zarr_path": "./swapt-shuffle/data.zarr.zip",
+    "dataset_name": "swapt-shuffle",
+    "language": "use the empty target area as a buffer to shuffle the blue and red T blocks into each other's original starting area"
+  },
+  {
+    "zarr_path": "./swapt-direct/data.zarr.zip",
+    "dataset_name": "swapt-direct",
+    "language": "push the blue and red T blocks to the middle, stop on the black dot, then swap them to overlap with each other's starting area"
+  }
+]

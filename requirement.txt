@@ -1,0 +1,43 @@
+# requirements_cloud.txt
+#
+# Install on the cloud server BEFORE running train_cloud.sh.
+#
+# Quick install:
+#   pip install -r requirements_cloud.txt
+#
+# Then install the custom HiF-VLA + transformers forks:
+#   pip install -e HiF-VLA/
+#   pip install git+https://github.com/moojink/transformers-openvla-oft.git
+#
+# Finally login to services:
+#   wandb login
+#   huggingface-cli login   # only if using gated repos
+
+# ---- Core deep-learning stack ----
+torch>=2.1.0
+torchvision>=0.16.0
+accelerate>=0.27.0
+
+# ---- HuggingFace ecosystem ----
+huggingface_hub>=0.21.0
+datasets>=2.18.0
+
+# ---- Data / zarr ----
+zarr>=2.16.0
+numpy>=1.23.5,<2.0.0      # tensorflow 2.15 requires numpy<2
+Pillow>=9.0.0
+
+# ---- Optical flow ----
+opencv-python-headless>=4.8.0
+
+# ---- Push-T environment ----
+gym==0.21.0
+pymunk==6.2.1
+shapely>=2.0.0
+
+# ---- Logging ----
+wandb>=0.17.0
+
+# ---- Misc ----
+draccus>=0.8.0
+tqdm

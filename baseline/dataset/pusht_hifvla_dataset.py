@@ -130,13 +130,23 @@ class PushTHiFVLADataset(IterableDataset):
     flow_stats_path : str, optional
         Path to a ``.npz`` file for flow mean/std statistics.  Computed from
         training episodes and saved on first run.
-    stats_save_path : str, optional
-        Path where ``dataset_statistics.json`` will be written.  Pass
-        ``run_dir / "dataset_statistics.json"`` from the training script.
     train : bool
         If True use training episodes; if False use held-out validation eps.
     val_fraction : float
         Fraction of episodes (from the end) reserved for validation.
+    dataset_name : str, optional
+        Key written to ``dataset_statistics.json`` and sample ``dataset_name``.
+        Defaults to ``DATASET_NAME`` (``"swap_3t"``).
+    language_instruction : str, optional
+        Task text inserted into the human prompt (after \"take to \").
+        Defaults to ``PUSHT_LANGUAGE_INSTRUCTION``.
+    proprio_output_dim : int, optional
+        If set, proprio vectors are zero-padded to this length (use the max dim
+        across mixed tasks so one ``ProprioProjector`` fits all).
+    stats_save_path : str, optional
+        Path where ``dataset_statistics.json`` will be written.  Pass
+        ``run_dir / "dataset_statistics.json"`` from the training script.
+        Pass ``None`` when this loader is wrapped by ``MultiTaskPushTHiFVLADataset``.
     """
 
     @staticmethod
@@ -151,12 +161,34 @@ class PushTHiFVLADataset(IterableDataset):
                                     repo_type=dataset)
         """
         if zarr_path.startswith("hf://"):
+            import os
             from huggingface_hub import hf_hub_download
-            # Format: hf://<repo_id>/<filename>
-            _, rest = zarr_path.split("hf://", 1)
-            repo_id, filename = rest.split("/", 1)
-            print(f"[PushTHiFVLADataset] Downloading zarr from HF Hub: {repo_id}/{filename}")
-            zarr_path = hf_hub_download(repo_id=repo_id, filename=filename, repo_type="dataset")
+            # Format: hf://<org>/<repo>/<filename_path>
+            # HF Hub repo IDs are always "org/repo" (exactly one slash), so the
+            # filename starts at the third path component.
+            rest = zarr_path[len("hf://"):]
+            parts = rest.split("/", 2)  # ['org', 'repo', 'path/to/file']
+            if len(parts) < 3:
+                raise ValueError(
+                    f"Invalid hf:// zarr path '{zarr_path}'. "
+                    "Expected format: hf://<org>/<repo>/<filename>"
+                )
+            repo_id = f"{parts[0]}/{parts[1]}"
+            filename = parts[2]
+            # Use HF_TOKEN env var for gated / private repos.
+            # Set it with: export HF_TOKEN=hf_xxx  or  huggingface-cli login
+            hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+            print(
+                f"[PushTHiFVLADataset] Downloading zarr from HF Hub: "
+                f"repo={repo_id}  file={filename}  "
+                f"(token={'set' if hf_token else 'NOT SET — may fail for private repos'})"
+            )
+            zarr_path = hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                repo_type="dataset",
+                token=hf_token or None,
+            )
 
         if zarr_path.endswith(".zip"):
             return zarr.open(zarr.ZipStore(zarr_path, mode="r"), mode="r")
@@ -175,6 +207,9 @@ class PushTHiFVLADataset(IterableDataset):
         stats_save_path: Optional[str] = None,
         train: bool = True,
         val_fraction: float = 0.1,
+        dataset_name: Optional[str] = None,
+        language_instruction: Optional[str] = None,
+        proprio_output_dim: Optional[int] = None,
     ) -> None:
         self.zarr_path = zarr_path
         self.action_tokenizer = action_tokenizer
@@ -182,6 +217,13 @@ class PushTHiFVLADataset(IterableDataset):
         self.image_transform = image_transform
         self.prompt_builder_fn = prompt_builder_fn
         self.history_length = history_length
+        self.dataset_name = dataset_name if dataset_name is not None else DATASET_NAME
+        self.language_instruction = (
+            language_instruction
+            if language_instruction is not None
+            else PUSHT_LANGUAGE_INSTRUCTION
+        )
+        self.proprio_output_dim = proprio_output_dim
 
         # ------------------------------------------------------------------
         # Load zarr arrays
@@ -244,7 +286,7 @@ class PushTHiFVLADataset(IterableDataset):
 
         # dataset_statistics.json  ─ compatible with OpenVLA's save/load logic
         self.dataset_statistics: Dict[str, Any] = {
-            DATASET_NAME: {
+            self.dataset_name: {
                 "action": action_stats,
                 "proprio": proprio_stats,
             }
@@ -319,10 +361,22 @@ class PushTHiFVLADataset(IterableDataset):
         norm_actions = _normalize_bounds_q99(raw_actions, self.action_q01, self.action_q99)
 
         # ── Proprio ────────────────────────────────────────────────────────
-        raw_state = self.states[global_t]      # (8,)
+        raw_state = self.states[global_t]
         norm_proprio = _normalize_bounds_q99(
             raw_state[None], self.proprio_q01, self.proprio_q99
-        )[0]                                    # (8,)
+        )[0]
+        if self.proprio_output_dim is not None:
+            d = int(norm_proprio.shape[0])
+            out_d = int(self.proprio_output_dim)
+            if d > out_d:
+                raise ValueError(
+                    f"State dim {d} exceeds proprio_output_dim={out_d} for "
+                    f"dataset '{self.dataset_name}'."
+                )
+            if d < out_d:
+                norm_proprio = np.concatenate(
+                    [norm_proprio, np.zeros(out_d - d, dtype=np.float32)]
+                )
 
         # ── Tokenise (mirrors RLDSBatchTransform exactly) ──────────────────
         current_action  = norm_actions[0]       # (2,)
@@ -337,7 +391,7 @@ class PushTHiFVLADataset(IterableDataset):
         conversation = [
             {
                 "from": "human",
-                "value": f"What action should the robot take to {PUSHT_LANGUAGE_INSTRUCTION}?",
+                "value": f"What action should the robot take to {self.language_instruction}?",
             },
             {"from": "gpt", "value": action_chunk_string},
         ]
@@ -365,7 +419,7 @@ class PushTHiFVLADataset(IterableDataset):
             "input_ids":    input_ids,
             "labels":       labels,
             "actions":      torch.tensor(norm_actions,  dtype=torch.float32),
-            "dataset_name": DATASET_NAME,
+            "dataset_name": self.dataset_name,
             "proprio":      torch.tensor(norm_proprio,  dtype=torch.float32),
             "mv_history":   torch.tensor(mv_history,    dtype=torch.float32),
             "mv_future":    torch.tensor(mv_future,     dtype=torch.float32),
@@ -387,3 +441,100 @@ class PushTHiFVLADataset(IterableDataset):
 
     def __len__(self) -> int:
         return len(self.valid_indices)
+
+
+def _safe_name_tag(name: str) -> str:
+    """Filesystem-safe suffix for per-task flow caches."""
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
+
+
+class MultiTaskPushTHiFVLADataset(IterableDataset):
+    """
+    Uniform mixture of several zarr-backed Push-T tasks.
+
+    Each task supplies its own zarr path, ``dataset_name`` (for
+    ``dataset_statistics.json`` / ``norm_stats``), and natural-language
+    instruction.  Samples from all tasks are shuffled into one stream.
+
+    Parameters
+    ----------
+    tasks : list of dict
+        Each dict must have keys ``zarr_path``, ``dataset_name``, and
+        ``language`` (or ``language_instruction``).
+    run_dir : Path
+        Directory for per-task ``flow_cache_*.npy`` / ``flow_stats_*.npz`` files.
+    proprio_output_dim : int
+        Passed to every child loader (use max state dim across zarrs).
+    """
+
+    def __init__(
+        self,
+        tasks: List[Dict[str, Any]],
+        action_tokenizer: ActionTokenizer,
+        base_tokenizer: PreTrainedTokenizerBase,
+        image_transform,
+        prompt_builder_fn: Type[PromptBuilder],
+        run_dir: Path,
+        history_length: int = 8,
+        train: bool = True,
+        val_fraction: float = 0.1,
+        proprio_output_dim: int = 8,
+    ) -> None:
+        self._datasets: List[PushTHiFVLADataset] = []
+        merged_stats: Dict[str, Any] = {}
+        run_dir = Path(run_dir)
+
+        for spec in tasks:
+            zpath = spec["zarr_path"]
+            dname = spec["dataset_name"]
+            lang = spec.get("language_instruction") or spec.get("language")
+            if not lang:
+                raise ValueError(
+                    f"Task '{dname}' needs 'language' or 'language_instruction'."
+                )
+            tag = _safe_name_tag(dname)
+            flow_cache = str(run_dir / f"flow_cache_{tag}.npy")
+            flow_stats = str(run_dir / f"flow_stats_{tag}.npz")
+            ds = PushTHiFVLADataset(
+                zarr_path=zpath,
+                action_tokenizer=action_tokenizer,
+                base_tokenizer=base_tokenizer,
+                image_transform=image_transform,
+                prompt_builder_fn=prompt_builder_fn,
+                history_length=history_length,
+                flow_cache_path=flow_cache,
+                flow_stats_path=flow_stats,
+                stats_save_path=None,
+                train=train,
+                val_fraction=val_fraction,
+                dataset_name=dname,
+                language_instruction=lang,
+                proprio_output_dim=proprio_output_dim,
+            )
+            self._datasets.append(ds)
+            if dname in merged_stats:
+                raise ValueError(f"Duplicate dataset_name in manifest: {dname!r}")
+            merged_stats.update(ds.dataset_statistics)
+
+        self.dataset_statistics = merged_stats
+        # Rollout code reuses one flow-stats file; first task must be representative.
+        first_tag = _safe_name_tag(tasks[0]["dataset_name"])
+        self.rollout_flow_stats_path = str(run_dir / f"flow_stats_{first_tag}.npz")
+
+        print(
+            f"[MultiTaskPushTHiFVLADataset] {len(self._datasets)} tasks, "
+            f"{len(self)} total training steps | rollout_flow_stats={self.rollout_flow_stats_path}"
+        )
+
+    def __iter__(self):
+        rng = np.random.default_rng()
+        triples: List[Tuple[PushTHiFVLADataset, int, int]] = []
+        for ds in self._datasets:
+            for ep_idx, global_t in ds.valid_indices:
+                triples.append((ds, ep_idx, global_t))
+        rng.shuffle(triples)
+        for ds, ep_idx, global_t in triples:
+            yield ds._build_sample(ep_idx, global_t)
+
+    def __len__(self) -> int:
+        return sum(len(ds) for ds in self._datasets)
