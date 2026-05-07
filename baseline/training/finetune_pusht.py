@@ -174,6 +174,31 @@ class FinetuneConfig:
     # fmt: on
 
 
+def _resolve_path_for_training(
+    raw: str,
+    project_root: Path,
+    *,
+    must_be_file: bool = False,
+) -> Path:
+    """Resolve a path that may be relative to cwd (e.g. HiF-VLA) or project root.
+
+    Joining ``project_root / Path("../foo")`` incorrectly escapes the repo
+    (e.g. becomes ``/workspace/foo``).  Prefer ``cwd / raw`` first.
+    """
+    p = Path(raw)
+    if p.is_absolute():
+        return p.resolve()
+    cand_cwd = (Path.cwd() / p).resolve()
+    exists_cwd = cand_cwd.is_file() if must_be_file else cand_cwd.exists()
+    if exists_cwd:
+        return cand_cwd
+    cand_root = (project_root / p).resolve()
+    exists_root = cand_root.is_file() if must_be_file else cand_root.exists()
+    if exists_root:
+        return cand_root
+    return cand_cwd
+
+
 def load_task_manifest(manifest_path: Path, project_root: Path) -> List[Dict[str, Any]]:
     """Load a JSON manifest of multi-task training specs.
 
@@ -205,12 +230,7 @@ def load_task_manifest(manifest_path: Path, project_root: Path) -> List[Dict[str
         if isinstance(zp, str) and zp.startswith("hf://"):
             zpath_resolved = zp
         else:
-            p = Path(zp)
-            if not p.is_absolute():
-                p = (project_root / p).resolve()
-            else:
-                p = p.resolve()
-            zpath_resolved = str(p)
+            zpath_resolved = str(_resolve_path_for_training(zp, project_root, must_be_file=False))
         tasks.append({
             "zarr_path": zpath_resolved,
             "dataset_name": dname,
@@ -756,11 +776,15 @@ def finetune(cfg: FinetuneConfig) -> None:
     tasks_list: Optional[List[Dict[str, Any]]] = None
 
     if use_manifest:
-        manifest_path = Path(cfg.task_manifest)
-        if not manifest_path.is_absolute():
-            manifest_path = (_PROJECT_ROOT / manifest_path).resolve()
-        else:
-            manifest_path = manifest_path.resolve()
+        manifest_path = _resolve_path_for_training(
+            cfg.task_manifest, _PROJECT_ROOT, must_be_file=True
+        )
+        if not manifest_path.is_file():
+            raise FileNotFoundError(
+                f"task manifest not found: {cfg.task_manifest!r} "
+                f"(resolved to {manifest_path}). "
+                "Use an absolute path or a path relative to the repo root / cwd."
+            )
         tasks_list = load_task_manifest(manifest_path, _PROJECT_ROOT)
         print(f"[task_manifest] Loaded {len(tasks_list)} tasks from {manifest_path}")
     elif cfg.use_hf_dataset:

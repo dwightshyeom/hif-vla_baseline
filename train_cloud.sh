@@ -13,12 +13,17 @@
 #
 # Usage:
 #   WANDB_ENTITY=seansyeom3 ZARR_PATH=/workspace/data.zarr.zip bash train_cloud.sh
+#
+# Multi-GPU (DDP): set how many processes = GPUs to use (default 6).
+#   NUM_GPUS=6 bash train_cloud.sh
+#   NUM_GPUS=1 bash train_cloud.sh   # single GPU
 
 set -euo pipefail
 
 # -----------------------------------------------------------------------
 # Configurable defaults (override via env vars before calling this script)
 # -----------------------------------------------------------------------
+NUM_GPUS="${NUM_GPUS:-6}"
 WANDB_ENTITY="${WANDB_ENTITY:-your-wandb-entity}"
 WANDB_PROJECT="${WANDB_PROJECT:-hifvla-pusht}"
 
@@ -64,7 +69,11 @@ export TOKENIZERS_PARALLELISM=false
 # Build dataset flags
 # -----------------------------------------------------------------------
 if [ -n "${TASK_MANIFEST}" ]; then
-    DATASET_FLAGS="--task_manifest ../${TASK_MANIFEST}"
+    if [[ "${TASK_MANIFEST}" = /* ]]; then
+        DATASET_FLAGS="--task_manifest ${TASK_MANIFEST}"
+    else
+        DATASET_FLAGS="--task_manifest ${SCRIPT_DIR}/${TASK_MANIFEST}"
+    fi
     DATASET_LABEL="multi-task ${TASK_MANIFEST}"
 elif [ -n "${ZARR_PATH}" ]; then
     # Local dataset (uploaded .zip or directory)
@@ -95,11 +104,12 @@ echo "  VLA            : ${VLA_PATH}"
 echo "  Dataset        : ${DATASET_LABEL}"
 echo "  W&B entity     : ${WANDB_ENTITY}"
 echo "  Run root       : ${RUN_ROOT}"
+echo "  GPUs (processes): ${NUM_GPUS}"
 echo "  Rollout every  : ${ROLLOUT_FREQ} steps"
 echo "========================================================"
 
 accelerate launch \
-    --num_processes 1 \
+    --num_processes "${NUM_GPUS}" \
     --mixed_precision bf16 \
     ../baseline/training/finetune_pusht.py \
     --vla_path          "${VLA_PATH}" \
