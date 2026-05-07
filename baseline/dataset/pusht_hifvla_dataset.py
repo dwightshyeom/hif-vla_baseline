@@ -101,6 +101,24 @@ def _normalize_bounds_q99(
 
 
 # ---------------------------------------------------------------------------
+# Zarr zip compatibility (zarr v2: zarr.ZipStore; zarr v3: zarr.storage.ZipStore)
+# ---------------------------------------------------------------------------
+
+def _open_zarr_from_zip(zip_path: str):
+    """Open a zarr hierarchy stored in a single .zip file (v2 / v3 API)."""
+    if hasattr(zarr, "ZipStore"):
+        zs = zarr.ZipStore(zip_path, mode="r")
+    else:
+        # zarr-python 3.x
+        zs = zarr.storage.ZipStore(zip_path, mode="r")
+    try:
+        return zarr.open(zs, mode="r")
+    except TypeError:
+        # zarr v3 may require keyword ``store=``
+        return zarr.open(store=zs, mode="r")
+
+
+# ---------------------------------------------------------------------------
 # Main dataset class
 # ---------------------------------------------------------------------------
 
@@ -191,7 +209,7 @@ class PushTHiFVLADataset(IterableDataset):
             )
 
         if zarr_path.endswith(".zip"):
-            return zarr.open(zarr.ZipStore(zarr_path, mode="r"), mode="r")
+            return _open_zarr_from_zip(zarr_path)
         return zarr.open(zarr_path, "r")
 
     def __init__(
