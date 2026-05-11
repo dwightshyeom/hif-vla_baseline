@@ -567,13 +567,21 @@ def finetune(cfg: FinetuneConfig) -> None:
     # ------------------------------------------------------------------
     # Load VLA backbone
     # ------------------------------------------------------------------
+    # Resolve HF Hub IDs to a local snapshot path first so that
+    # Auto-class registration and update_auto_map always operate on
+    # a local directory (avoids the race where trust_remote_code loads
+    # the original OpenVLA code before the HiF-VLA patch is applied).
     if model_is_on_hf_hub(cfg.vla_path):
         cfg.vla_path = snapshot_download(repo_id=cfg.vla_path)
-    else:
-        AutoConfig.register("openvla", OpenVLAConfig)
-        AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
-        AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
-        AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
+
+    # Always register the HiF-VLA classes explicitly so that
+    # AutoModelForVision2Seq uses our modified OpenVLAForActionPrediction
+    # (which has set_num_images_in_input, predict_action, etc.) regardless
+    # of what trust_remote_code finds in the cached model files.
+    AutoConfig.register("openvla", OpenVLAConfig)
+    AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
+    AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
+    AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
 
     if distributed_state.is_main_process:
         update_auto_map(cfg.vla_path)
